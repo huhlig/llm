@@ -4,12 +4,12 @@
 
 > **Note**: This crate name previously belonged to another project. The current implementation represents a new and different library. The previous crate is now archived and will not receive any updates. **ref: https://github.com/rustformers/llm**
 
-**LLM** is a **Rust** library that lets you use **multiple LLM backends** in a single project: [OpenAI](https://openai.com), [Anthropic (Claude)](https://www.anthropic.com), [Ollama](https://github.com/ollama/ollama), [DeepSeek](https://www.deepseek.com), [xAI](https://x.ai), [Phind](https://www.phind.com), [Groq](https://www.groq.com), [Google](https://cloud.google.com/gemini), [Cohere](https://cohere.com), [Mistral](https://mistral.ai), [Hugging Face](https://huggingface.co) and [ElevenLabs](https://elevenlabs.io).
+**LLM** is a **Rust** library that lets you use **multiple LLM backends** in a single project: [OpenAI](https://openai.com), [Anthropic (Claude)](https://www.anthropic.com), [Ollama](https://github.com/ollama/ollama), [DeepSeek](https://www.deepseek.com), [xAI](https://x.ai), [Phind](https://www.phind.com), [Groq](https://www.groq.com), [Google](https://cloud.google.com/gemini), [Cohere](https://cohere.com), [Mistral](https://mistral.ai), [Hugging Face](https://huggingface.co), [mistral.rs](https://github.com/EricLBuehler/mistral.rs) and [ElevenLabs](https://elevenlabs.io).
 With a **unified API** and **builder style** - similar to the Stripe experience - you can easily create **chat**, text **completion**, speak-to-text requests without multiplying structures and crates.
 
 ## Key Features
 
-- **Multi-backend**: Manage OpenAI, Anthropic, Ollama, DeepSeek, xAI, Phind, Groq, OpenRouter, Cohere, Elevenlabs and Google through a single entry point.
+- **Multi-backend**: Manage OpenAI, Anthropic, Ollama, DeepSeek, xAI, Phind, Groq, OpenRouter, Cohere, Elevenlabs, Google and mistral.rs through a single entry point.
 - **Multi-step chains**: Create multi-step chains with different backends at each step.
 - **Templates**: Use templates to create complex prompts with variables.
 - **Builder pattern**: Configure your LLM (model, temperature, max_tokens, timeouts...) with a few simple calls.
@@ -36,7 +36,7 @@ Simply add **LLM** to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-llm = { version = "1.2.4", features = ["openai", "anthropic", "ollama", "deepseek", "xai", "phind", "google", "groq", "mistral", "Elevenlabs"] }
+llm = { version = "1.2.4", features = ["openai", "anthropic", "ollama", "deepseek", "xai", "phind", "google", "groq", "mistral", "mistral_rs", "Elevenlabs"] }
 ```
 
 ## Use any LLM on cli
@@ -57,7 +57,7 @@ LLM includes a command-line tool for easily interacting with different LLM model
 
 ```shell
 [dependencies]
-llm = { version = "1.2.4", features = ["openai", "anthropic", "ollama", "deepseek", "xai", "phind", "google", "groq", "api", "mistral", "elevenlabs"] }
+llm = { version = "1.2.4", features = ["openai", "anthropic", "ollama", "deepseek", "xai", "phind", "google", "groq", "api", "mistral", "mistral_rs", "elevenlabs"] }
 ```
 
 More details in the [`api_example`](examples/api_example.rs)
@@ -73,6 +73,7 @@ More details in the [`api_example`](examples/api_example.rs)
 | [`embedding_example`](examples/embedding_example.rs) | Basic embedding example with OpenAI's API |
 | [`multi_backend_example`](examples/multi_backend_example.rs) | Illustrates chaining multiple LLM backends (OpenAI, Anthropic, DeepSeek) together in a single workflow |
 | [`ollama_example`](examples/ollama_example.rs) | Example of using local LLMs through Ollama integration |
+| [`mistral_rs_example`](examples/mistral_rs_example.rs) | Example of using local LLMs through mistral.rs integration |
 | [`openai_example`](examples/openai_example.rs) | Basic OpenAI chat completion example with GPT models |
 | [`resilient_example`](examples/resilient_example.rs) | Simple retry/backoff wrapper usage |
 | [`openai_streaming_example`](examples/openai_streaming_example.rs) | OpenAI streaming chat example demonstrating real-time token generation |

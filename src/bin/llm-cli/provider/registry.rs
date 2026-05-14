@@ -107,7 +107,7 @@ fn provider_capabilities(backend: &LLMBackend) -> ProviderCapabilities {
         | LLMBackend::HuggingFace
         | LLMBackend::Anthropic => ProviderCapabilities::FULL,
         LLMBackend::Google | LLMBackend::AwsBedrock => ProviderCapabilities::TOOLS_NO_STREAM,
-        LLMBackend::Ollama => ProviderCapabilities::LOCAL_BASIC,
+        LLMBackend::Ollama | LLMBackend::MistralRs => ProviderCapabilities::LOCAL_BASIC,
         LLMBackend::Phind => ProviderCapabilities::STREAM_ONLY,
         LLMBackend::ElevenLabs => ProviderCapabilities::NONE,
     }
