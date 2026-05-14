@@ -1,6 +1,11 @@
-//! mistral.rs API client implementation for chat and embedding functionality.
+//! mistral.rs backend - embedded local LLM inference with optional server mode.
 //!
-//! This module provides integration with mistral.rs local LLM server through its OpenAI-compatible API.
+//! This module provides two modes:
+//! - **Embedded**: In-process inference using the `mistralrs` crate directly
+//! - **Server**: HTTP connection to a running mistral.rs server (OpenAI-compatible API)
+//!
+//! Embedded mode requires the `mistral_rs` feature and downloads/models the model locally.
+//! Server mode requires the `mistral_rs_server` feature and connects to a running server.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -23,27 +28,66 @@ use async_trait::async_trait;
 use base64::{self, Engine};
 use chrono::{DateTime, Utc};
 use futures::Stream;
-use reqwest::Client;
-use secrecy::ExposeSecret;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+/// Quantization bits for embedded mode
+#[derive(Debug, Clone, Copy, Default)]
+pub enum MistralRsQuantization {
+    /// 4-bit quantization (Q4)
+    Q4,
+    /// 8-bit quantization (Q8)
+    Q8,
+    /// No quantization (FP16)
+    #[default]
+    None,
+}
+
+/// Mode for mistral.rs backend
+#[derive(Debug, Clone)]
+pub enum MistralRsMode {
+    /// Embedded mode - runs inference in-process using the mistralrs crate
+    Embedded {
+        /// HuggingFace model ID or local path (e.g., "Qwen/Qwen3-4B")
+        model_id: String,
+        /// Quantization level
+        quantization: MistralRsQuantization,
+        /// Enable PagedAttention for better memory efficiency
+        paged_attention: bool,
+    },
+    /// Server mode - connects to a running mistral.rs HTTP server
+    Server {
+        /// Base URL of the mistral.rs server (e.g., "http://localhost:1234")
+        base_url: String,
+        /// Optional API key for authentication
+        api_key: Option<String>,
+        /// Model name as known to the server
+        model: String,
+    },
+}
+
+impl Default for MistralRsMode {
+    fn default() -> Self {
+        MistralRsMode::Server {
+            base_url: "http://localhost:1234".to_string(),
+            api_key: None,
+            model: "default".to_string(),
+        }
+    }
+}
 
 /// Configuration for the mistral.rs client.
 #[derive(Debug)]
 pub struct MistralRsConfig {
-    /// Base URL for the mistral.rs API.
-    pub base_url: String,
-    /// Optional API key for authentication.
-    pub api_key: Option<String>,
-    /// Model identifier.
-    pub model: String,
+    /// Mode: embedded or server
+    pub mode: MistralRsMode,
     /// Maximum tokens to generate in responses.
     pub max_tokens: Option<u32>,
     /// Sampling temperature for response randomness.
     pub temperature: Option<f32>,
     /// System prompt to guide model behavior.
     pub system: Option<String>,
-    /// Request timeout in seconds.
+    /// Request timeout in seconds (server mode only).
     pub timeout_seconds: Option<u64>,
     /// Top-p (nucleus) sampling parameter.
     pub top_p: Option<f32>,
@@ -55,24 +99,22 @@ pub struct MistralRsConfig {
     pub tools: Option<Vec<Tool>>,
 }
 
-/// Client for interacting with mistral.rs's OpenAI-compatible API.
-///
-/// Provides methods for chat and completion requests using mistral.rs's models.
-///
-/// The client uses `Arc` internally for configuration, making cloning cheap.
-#[derive(Debug, Clone)]
+/// Client for mistral.rs - supports both embedded and server modes.
 pub struct MistralRs {
     /// Shared configuration wrapped in Arc for cheap cloning.
     pub config: Arc<MistralRsConfig>,
-    /// HTTP client for making requests.
-    pub client: Client,
+    /// HTTP client for server mode.
+    pub client: reqwest::Client,
+    /// Embedded model handle (only valid in embedded mode).
+    #[cfg(feature = "mistral_rs")]
+    pub embedded_model: Option<std::sync::Arc<mistralrs::Model>>,
 }
 
-/// Request payload for OpenAI-compatible chat API endpoint.
+// Server mode types
 #[derive(Serialize)]
-struct MistralRsChatRequest<'a> {
+struct ServerChatRequest<'a> {
     model: String,
-    messages: Vec<MistralRsChatMessage<'a>>,
+    messages: Vec<ServerChatMessage<'a>>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
@@ -81,42 +123,41 @@ struct MistralRsChatRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<MistralRsTool>>,
+    tools: Option<Vec<ServerTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<Value>,
 }
 
-/// Individual message in a chat conversation.
 #[derive(Serialize)]
-struct MistralRsChatMessage<'a> {
+struct ServerChatMessage<'a> {
     role: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<MistralRsMessageContent<'a>>,
+    content: Option<ServerMessageContent<'a>>,
 }
 
 #[derive(Serialize)]
 #[serde(untagged)]
-enum MistralRsMessageContent<'a> {
+enum ServerMessageContent<'a> {
     Text(&'a str),
-    Multimodal(Vec<MistralRsContentPart>),
+    Multimodal(Vec<ServerContentPart>),
 }
 
 #[derive(Serialize)]
-struct MistralRsContentPart {
+struct ServerContentPart {
     #[serde(rename = "type")]
     content_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    image_url: Option<MistralRsImageUrl>,
+    image_url: Option<ServerImageUrl>,
 }
 
 #[derive(Serialize)]
-struct MistralRsImageUrl {
+struct ServerImageUrl {
     url: String,
 }
 
-impl<'a> From<&'a ChatMessage> for MistralRsChatMessage<'a> {
+impl<'a> From<&'a ChatMessage> for ServerChatMessage<'a> {
     fn from(msg: &'a ChatMessage) -> Self {
         let role = match msg.role {
             ChatRole::User => "user",
@@ -124,73 +165,73 @@ impl<'a> From<&'a ChatMessage> for MistralRsChatMessage<'a> {
         };
 
         let content = match &msg.message_type {
-            MessageType::Text => Some(MistralRsMessageContent::Text(&msg.content)),
+            MessageType::Text => Some(ServerMessageContent::Text(&msg.content)),
             MessageType::Image((_mime, data)) => {
                 let base64_data = base64::engine::general_purpose::STANDARD.encode(data);
-                let data_url = format!("data:image/jpeg;base64,{}", base64_data);
-                Some(MistralRsMessageContent::Multimodal(vec![MistralRsContentPart {
+                Some(ServerMessageContent::Multimodal(vec![ServerContentPart {
                     content_type: "image_url".to_string(),
                     text: None,
-                    image_url: Some(MistralRsImageUrl { url: data_url }),
+                    image_url: Some(ServerImageUrl {
+                        url: format!("data:image/jpeg;base64,{}", base64_data),
+                    }),
                 }]))
             }
-            MessageType::ImageURL(url) => Some(MistralRsMessageContent::Multimodal(vec![
-                MistralRsContentPart {
+            MessageType::ImageURL(url) => Some(ServerMessageContent::Multimodal(vec![
+                ServerContentPart {
                     content_type: "image_url".to_string(),
                     text: None,
-                    image_url: Some(MistralRsImageUrl { url: url.clone() }),
+                    image_url: Some(ServerImageUrl { url: url.clone() }),
                 },
             ])),
-            _ => Some(MistralRsMessageContent::Text(&msg.content)),
+            _ => Some(ServerMessageContent::Text(&msg.content)),
         };
 
         Self { role, content }
     }
 }
 
-/// Response from mistral.rs API endpoints.
 #[derive(Deserialize, Debug)]
-struct MistralRsChatResponse {
+struct ServerChatResponse {
     id: Option<String>,
-    choices: Vec<MistralRsChoice>,
-    usage: Option<MistralRsUsage>,
+    choices: Vec<ServerChoice>,
+    usage: Option<ServerUsage>,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsChoice {
-    message: MistralRsResponseMessage,
+struct ServerChoice {
+    message: ServerResponseMessage,
     finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsResponseMessage {
+struct ServerResponseMessage {
     content: Option<String>,
     #[serde(rename = "tool_calls")]
-    tool_calls: Option<Vec<MistralRsToolCall>>,
+    tool_calls: Option<Vec<ServerToolCall>>,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsToolCall {
+struct ServerToolCall {
     id: String,
     #[serde(rename = "type")]
     call_type: String,
-    function: MistralRsFunctionCall,
+    function: ServerFunctionCall,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsFunctionCall {
+struct ServerFunctionCall {
     name: String,
     arguments: Value,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsUsage {
+struct ServerUsage {
     prompt_tokens: Option<u32>,
     completion_tokens: Option<u32>,
     total_tokens: Option<u32>,
 }
 
-impl std::fmt::Display for MistralRsChatResponse {
+impl std::fmt::Display for ServerChatResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if let Some(choice) = self.choices.first() {
             if let Some(content) = &choice.message.content {
@@ -201,7 +242,7 @@ impl std::fmt::Display for MistralRsChatResponse {
     }
 }
 
-impl ChatResponse for MistralRsChatResponse {
+impl ChatResponse for ServerChatResponse {
     fn text(&self) -> Option<String> {
         self.choices
             .first()
@@ -238,26 +279,25 @@ impl ChatResponse for MistralRsChatResponse {
     }
 }
 
-/// Tool definition for mistral.rs
 #[derive(Serialize, Debug)]
-struct MistralRsTool {
+struct ServerTool {
     #[serde(rename = "type")]
     tool_type: String,
-    function: MistralRsFunctionTool,
+    function: ServerFunctionTool,
 }
 
 #[derive(Serialize, Debug)]
-struct MistralRsFunctionTool {
+struct ServerFunctionTool {
     name: String,
     description: String,
     parameters: Value,
 }
 
-impl From<&crate::chat::Tool> for MistralRsTool {
+impl From<&crate::chat::Tool> for ServerTool {
     fn from(tool: &crate::chat::Tool) -> Self {
-        MistralRsTool {
+        ServerTool {
             tool_type: "function".to_owned(),
-            function: MistralRsFunctionTool {
+            function: ServerFunctionTool {
                 name: tool.function.name.clone(),
                 description: tool.function.description.clone(),
                 parameters: tool.function.parameters.clone(),
@@ -266,90 +306,66 @@ impl From<&crate::chat::Tool> for MistralRsTool {
     }
 }
 
-/// Request payload for embedding API endpoint.
 #[derive(Serialize)]
-struct MistralRsEmbeddingRequest {
+struct ServerEmbeddingRequest {
     model: String,
     input: Vec<String>,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsEmbeddingResponse {
-    data: Vec<MistralRsEmbeddingData>,
+struct ServerEmbeddingResponse {
+    data: Vec<ServerEmbeddingData>,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsEmbeddingData {
+struct ServerEmbeddingData {
     index: usize,
     embedding: Vec<f32>,
 }
 
-/// Request payload for streaming chat.
-#[derive(Serialize)]
-struct MistralRsChatStreamRequest<'a> {
-    model: String,
-    messages: Vec<MistralRsChatMessage<'a>>,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    max_tokens: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    temperature: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    top_p: Option<f32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tools: Option<Vec<MistralRsTool>>,
-}
-
-/// Streaming response chunk
 #[derive(Deserialize, Debug)]
-struct MistralRsStreamChunk {
+struct ServerStreamChunk {
     id: Option<String>,
-    choices: Vec<MistralRsStreamChoice>,
+    choices: Vec<ServerStreamChoice>,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsStreamChoice {
-    delta: MistralRsStreamDelta,
+struct ServerStreamChoice {
+    delta: ServerStreamDelta,
     finish_reason: Option<String>,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsStreamDelta {
+struct ServerStreamDelta {
     content: Option<String>,
     #[serde(rename = "tool_calls")]
-    tool_calls: Option<Vec<MistralRsStreamToolCall>>,
+    tool_calls: Option<Vec<ServerStreamToolCall>>,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsStreamToolCall {
+struct ServerStreamToolCall {
     index: Option<usize>,
     id: Option<String>,
     #[serde(rename = "type")]
     call_type: Option<String>,
-    function: Option<MistralRsStreamFunction>,
+    function: Option<ServerStreamFunction>,
 }
 
 #[derive(Deserialize, Debug)]
-struct MistralRsStreamFunction {
+struct ServerStreamFunction {
     name: Option<String>,
     arguments: Option<String>,
 }
 
-/// Model listing response
-#[derive(Deserialize, Debug)]
-struct MistralRsModelListResponse {
-    data: Vec<MistralRsModelData>,
-}
-
 #[derive(Deserialize, Debug, Clone)]
-struct MistralRsModelData {
+struct ServerModelData {
     id: String,
     created: Option<i64>,
     #[serde(flatten)]
     extra: Value,
 }
 
-impl ModelListRawEntry for MistralRsModelData {
+impl ModelListRawEntry for ServerModelData {
     fn get_id(&self) -> String {
         self.id.clone()
     }
@@ -365,7 +381,12 @@ impl ModelListRawEntry for MistralRsModelData {
     }
 }
 
-impl ModelListResponse for MistralRsModelListResponse {
+#[derive(Deserialize, Debug)]
+struct ServerModelListResponse {
+    data: Vec<ServerModelData>,
+}
+
+impl ModelListResponse for ServerModelListResponse {
     fn get_models(&self) -> Vec<String> {
         self.data.iter().map(|m| m.id.clone()).collect()
     }
@@ -384,158 +405,141 @@ impl ModelListResponse for MistralRsModelListResponse {
 }
 
 impl MistralRs {
-    /// Creates a new mistral.rs client with the specified configuration.
-    ///
-    /// # Arguments
-    ///
-    /// * `base_url` - Base URL of the mistral.rs server (e.g., "http://localhost:1234")
-    /// * `api_key` - Optional API key for authentication
-    /// * `model` - Model name to use
-    /// * `max_tokens` - Maximum tokens to generate
-    /// * `temperature` - Sampling temperature
-    /// * `timeout_seconds` - Request timeout in seconds
-    /// * `system` - System prompt
-    /// * `top_p` - Top-p sampling parameter
-    /// * `top_k` - Top-k sampling parameter
-    /// * `json_schema` - JSON schema for structured output
-    /// * `tools` - Function tools that the model can use
-    #[allow(clippy::too_many_arguments)]
-    #[allow(unused_variables)]
-    pub fn new(
-        base_url: impl Into<String>,
-        api_key: Option<String>,
-        model: Option<String>,
+    /// Creates a new mistral.rs client with embedded mode.
+    #[cfg(feature = "mistral_rs")]
+    pub async fn new_embedded(
+        model_id: impl Into<String>,
+        quantization: MistralRsQuantization,
         max_tokens: Option<u32>,
         temperature: Option<f32>,
-        timeout_seconds: Option<u64>,
         system: Option<String>,
         top_p: Option<f32>,
         top_k: Option<u32>,
         json_schema: Option<StructuredOutputFormat>,
         tools: Option<Vec<Tool>>,
-    ) -> Self {
-        let mut builder = Client::builder();
-        if let Some(sec) = timeout_seconds {
-            builder = builder.timeout(std::time::Duration::from_secs(sec));
-        }
-        Self::with_client(
-            builder.build().expect("Failed to build reqwest Client"),
-            base_url,
-            api_key,
-            model,
-            max_tokens,
-            temperature,
-            timeout_seconds,
-            system,
-            top_p,
-            top_k,
-            json_schema,
-            tools,
-        )
-    }
+    ) -> Result<Self, LLMError> {
+        use mistralrs::{IsqBits, ModelBuilder, PagedAttentionMetaBuilder};
 
-    /// Creates a new mistral.rs client with a custom HTTP client.
-    #[allow(clippy::too_many_arguments)]
-    pub fn with_client(
-        client: Client,
-        base_url: impl Into<String>,
-        api_key: Option<String>,
-        model: Option<String>,
-        max_tokens: Option<u32>,
-        temperature: Option<f32>,
-        timeout_seconds: Option<u64>,
-        system: Option<String>,
-        top_p: Option<f32>,
-        top_k: Option<u32>,
-        json_schema: Option<StructuredOutputFormat>,
-        tools: Option<Vec<Tool>>,
-    ) -> Self {
-        Self {
+        let model_id = model_id.into();
+
+        let mut builder = ModelBuilder::new(&model_id).with_auto_isq(match quantization {
+            MistralRsQuantization::Q4 => IsqBits::Four,
+            MistralRsQuantization::Q8 => IsqBits::Eight,
+            MistralRsQuantization::None => IsqBits::Two, // Use lowest quantization as fallback
+        });
+
+        builder = builder.with_paged_attn(PagedAttentionMetaBuilder::default().build().map_err(|e| {
+            LLMError::ProviderError(format!("Failed to build paged attention: {}", e))
+        })?);
+
+        let model = builder
+            .build()
+            .await
+            .map_err(|e| LLMError::ProviderError(format!("Failed to load model: {}", e)))?;
+
+        Ok(Self {
             config: Arc::new(MistralRsConfig {
-                base_url: base_url.into(),
-                api_key,
-                model: model.unwrap_or("default".to_string()),
-                temperature,
+                mode: MistralRsMode::Embedded {
+                    model_id,
+                    quantization,
+                    paged_attention: true,
+                },
                 max_tokens,
-                timeout_seconds,
+                temperature,
                 system,
+                timeout_seconds: None,
                 top_p,
                 top_k,
                 json_schema,
                 tools,
             }),
-            client,
+            client: reqwest::Client::new(),
+            embedded_model: Some(Arc::new(model)),
+        })
+    }
+
+    /// Creates a new mistral.rs client with server mode.
+    pub fn new_server(
+        base_url: impl Into<String>,
+        api_key: Option<String>,
+        model: Option<String>,
+        max_tokens: Option<u32>,
+        temperature: Option<f32>,
+        timeout_seconds: Option<u64>,
+        system: Option<String>,
+        top_p: Option<f32>,
+        top_k: Option<u32>,
+        json_schema: Option<StructuredOutputFormat>,
+        tools: Option<Vec<Tool>>,
+    ) -> Self {
+        let mut builder = reqwest::Client::builder();
+        if let Some(sec) = timeout_seconds {
+            builder = builder.timeout(std::time::Duration::from_secs(sec));
+        }
+        Self {
+            config: Arc::new(MistralRsConfig {
+                mode: MistralRsMode::Server {
+                    base_url: base_url.into(),
+                    api_key,
+                    model: model.unwrap_or("default".to_string()),
+                },
+                max_tokens,
+                temperature,
+                system,
+                timeout_seconds,
+                top_p,
+                top_k,
+                json_schema,
+                tools,
+            }),
+            client: builder
+                .build()
+                .expect("Failed to build reqwest Client"),
+            #[cfg(feature = "mistral_rs")]
+            embedded_model: None,
         }
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.config.base_url
+    fn is_embedded(&self) -> bool {
+        matches!(self.config.mode, MistralRsMode::Embedded { .. })
     }
 
-    pub fn api_key(&self) -> Option<&str> {
-        self.config.api_key.as_deref()
+    fn get_server_config(&self) -> Option<(&str, &str, Option<&str>)> {
+        match &self.config.mode {
+            MistralRsMode::Server {
+                base_url,
+                model,
+                api_key,
+            } => Some((base_url, model, api_key.as_deref())),
+            _ => None,
+        }
     }
 
-    pub fn model(&self) -> &str {
-        &self.config.model
-    }
-
-    pub fn max_tokens(&self) -> Option<u32> {
-        self.config.max_tokens
-    }
-
-    pub fn temperature(&self) -> Option<f32> {
-        self.config.temperature
-    }
-
-    pub fn timeout_seconds(&self) -> Option<u64> {
-        self.config.timeout_seconds
-    }
-
-    pub fn system(&self) -> Option<&str> {
-        self.config.system.as_deref()
-    }
-
-    pub fn top_p(&self) -> Option<f32> {
-        self.config.top_p
-    }
-
-    pub fn top_k(&self) -> Option<u32> {
-        self.config.top_k
-    }
-
-    pub fn json_schema(&self) -> Option<&StructuredOutputFormat> {
-        self.config.json_schema.as_ref()
-    }
-
-    pub fn tools(&self) -> Option<&[Tool]> {
-        self.config.tools.as_deref()
-    }
-
-    pub fn client(&self) -> &Client {
-        &self.client
-    }
-
-    fn make_chat_request<'a>(
+    fn make_server_chat_request<'a>(
         &'a self,
         messages: &'a [ChatMessage],
         tools: Option<&'a [Tool]>,
         stream: bool,
-    ) -> MistralRsChatRequest<'a> {
-        let mut chat_messages: Vec<MistralRsChatMessage> =
-            messages.iter().map(MistralRsChatMessage::from).collect();
+    ) -> Option<ServerChatRequest<'a>> {
+        let (base_url, model, _) = self.get_server_config()?;
+        if base_url.is_empty() {
+            return None;
+        }
+
+        let mut chat_messages: Vec<ServerChatMessage> =
+            messages.iter().map(ServerChatMessage::from).collect();
 
         if let Some(system) = &self.config.system {
             chat_messages.insert(
                 0,
-                MistralRsChatMessage {
+                ServerChatMessage {
                     role: "system",
-                    content: Some(MistralRsMessageContent::Text(system)),
+                    content: Some(ServerMessageContent::Text(system)),
                 },
             );
         }
 
-        let mistral_rs_tools = tools.map(|t| t.iter().map(MistralRsTool::from).collect());
+        let server_tools = tools.map(|t| t.iter().map(ServerTool::from).collect());
 
         let response_format = if let Some(schema) = &self.config.json_schema {
             schema.schema.as_ref().map(|s| {
@@ -550,16 +554,16 @@ impl MistralRs {
             None
         };
 
-        MistralRsChatRequest {
-            model: self.config.model.clone(),
+        Some(ServerChatRequest {
+            model: model.to_string(),
             messages: chat_messages,
             stream,
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
             top_p: self.config.top_p,
-            tools: mistral_rs_tools,
+            tools: server_tools,
             response_format,
-        }
+        })
     }
 }
 
@@ -573,36 +577,62 @@ impl ChatProvider for MistralRs {
         tools: Option<&[Tool]>,
     ) -> Result<Box<dyn ChatResponse>, LLMError> {
         crate::chat::ensure_no_audio(messages, AUDIO_UNSUPPORTED)?;
-        if self.config.base_url.is_empty() {
-            return Err(LLMError::InvalidRequest("Missing base_url".to_string()));
-        }
 
-        let req_body = self.make_chat_request(messages, tools, false);
+        if self.is_embedded() {
+            #[cfg(feature = "mistral_rs")]
+            {
+                if let Some(model) = &self.embedded_model {
+                    use mistralrs::{RequestBuilder, TextMessageRole, TextMessages};
 
-        if log::log_enabled!(log::Level::Trace) {
-            if let Ok(json) = serde_json::to_string(&req_body) {
-                log::trace!("mistral.rs request payload (tools): {}", json);
+                    let mut text_messages = TextMessages::new();
+
+                    if let Some(system) = &self.config.system {
+                        text_messages = text_messages.add_message(
+                            TextMessageRole::System,
+                            system.as_str(),
+                        );
+                    }
+
+                    for msg in messages {
+                        let role = match msg.role {
+                            ChatRole::User => TextMessageRole::User,
+                            ChatRole::Assistant => TextMessageRole::Assistant,
+                        };
+                        text_messages = text_messages.add_message(role, msg.content.as_str());
+                    }
+
+                    let response = model
+                        .send_chat_request(text_messages)
+                        .await
+                        .map_err(|e| LLMError::ProviderError(format!("Chat error: {}", e)))?;
+
+                    return Ok(Box::new(EmbeddedChatResponse(response)));
+                }
             }
+            return Err(LLMError::ProviderError(
+                "Embedded model not loaded".to_string(),
+            ));
         }
 
-        let url = format!("{}/v1/chat/completions", self.config.base_url);
+        // Server mode
+        let req_body = self
+            .make_server_chat_request(messages, tools, false)
+            .ok_or_else(|| LLMError::InvalidRequest("Missing server configuration".to_string()))?;
+
+        let (base_url, _, api_key) = self.get_server_config().unwrap();
+        let url = format!("{}/v1/chat/completions", base_url);
 
         let mut request = self.client.post(&url).json(&req_body);
 
-        if let Some(api_key) = &self.config.api_key {
-            request = request.bearer_auth(api_key);
-        }
-
-        if let Some(timeout) = self.config.timeout_seconds {
-            request = request.timeout(std::time::Duration::from_secs(timeout));
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
         }
 
         let resp = request.send().await?;
-
         log::debug!("mistral.rs HTTP status (tools): {}", resp.status());
 
         let resp = resp.error_for_status()?;
-        let json_resp = resp.json::<MistralRsChatResponse>().await?;
+        let json_resp = resp.json::<ServerChatResponse>().await?;
 
         Ok(Box::new(json_resp))
     }
@@ -612,17 +642,24 @@ impl ChatProvider for MistralRs {
         messages: &[ChatMessage],
     ) -> Result<Pin<Box<dyn Stream<Item = Result<String, LLMError>> + Send>>, LLMError> {
         crate::chat::ensure_no_audio(messages, AUDIO_UNSUPPORTED)?;
-        let req_body = self.make_chat_request(messages, None, true);
 
-        let url = format!("{}/v1/chat/completions", self.config.base_url);
-        let mut request = self.client.post(&url).json(&req_body);
-
-        if let Some(api_key) = &self.config.api_key {
-            request = request.bearer_auth(api_key.as_str());
+        if self.is_embedded() {
+            return Err(LLMError::ProviderError(
+                "Streaming not yet supported in embedded mode. Use server mode for streaming.".into(),
+            ));
         }
 
-        if let Some(timeout) = self.config.timeout_seconds {
-            request = request.timeout(std::time::Duration::from_secs(timeout));
+        // Server mode
+        let req_body = self
+            .make_server_chat_request(messages, None, true)
+            .ok_or_else(|| LLMError::InvalidRequest("Missing server configuration".to_string()))?;
+
+        let (base_url, _, api_key) = self.get_server_config().unwrap();
+        let url = format!("{}/v1/chat/completions", base_url);
+        let mut request = self.client.post(&url).json(&req_body);
+
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
         }
 
         let resp = request.send().await?;
@@ -630,20 +667,87 @@ impl ChatProvider for MistralRs {
 
         let resp = resp.error_for_status()?;
 
-        Ok(crate::chat::create_sse_stream(resp, parse_mistral_rs_sse))
+        Ok(crate::chat::create_sse_stream(resp, parse_server_sse))
+    }
+}
+
+#[cfg(feature = "mistral_rs")]
+struct EmbeddedChatResponse(mistralrs::ChatCompletionResponse);
+
+#[cfg(feature = "mistral_rs")]
+impl std::fmt::Debug for EmbeddedChatResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddedChatResponse").finish()
+    }
+}
+
+#[cfg(feature = "mistral_rs")]
+impl std::fmt::Display for EmbeddedChatResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(content) = self.0.choices.first().and_then(|c| c.message.content.as_ref()) {
+            write!(f, "{}", content)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(feature = "mistral_rs")]
+impl ChatResponse for EmbeddedChatResponse {
+    fn text(&self) -> Option<String> {
+        self.0
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_ref())
+            .map(|s| s.to_string())
+    }
+
+    fn tool_calls(&self) -> Option<Vec<ToolCall>> {
+        self.0.choices.first().and_then(|c| {
+            c.message.tool_calls.as_ref().map(|tcs| {
+                tcs.iter()
+                    .map(|tc| ToolCall {
+                        id: tc.id.clone(),
+                        call_type: "function".to_string(),
+                        function: FunctionCall {
+                            name: tc.function.name.clone(),
+                            arguments: serde_json::to_string(&tc.function.arguments)
+                                .unwrap_or_default(),
+                        },
+                    })
+                    .collect()
+            })
+        })
+    }
+
+    fn usage(&self) -> Option<crate::chat::Usage> {
+        Some(crate::chat::Usage {
+            prompt_tokens: self.0.usage.prompt_tokens as u32,
+            completion_tokens: self.0.usage.completion_tokens as u32,
+            total_tokens: self.0.usage.total_tokens as u32,
+            completion_tokens_details: None,
+            prompt_tokens_details: None,
+        })
     }
 }
 
 #[async_trait]
 impl CompletionProvider for MistralRs {
     async fn complete(&self, req: &CompletionRequest) -> Result<CompletionResponse, LLMError> {
-        if self.config.base_url.is_empty() {
-            return Err(LLMError::InvalidRequest("Missing base_url".to_string()));
+        if self.is_embedded() {
+            return Err(LLMError::ProviderError(
+                "Completion endpoint not supported in embedded mode. Use chat instead.".into(),
+            ));
         }
-        let url = format!("{}/v1/completions", self.config.base_url);
+
+        let (base_url, model, api_key) = self
+            .get_server_config()
+            .ok_or_else(|| LLMError::InvalidRequest("Missing server configuration".to_string()))?;
+
+        let url = format!("{}/v1/completions", base_url);
 
         let completion_req = serde_json::json!({
-            "model": self.config.model,
+            "model": model,
             "prompt": req.prompt,
             "max_tokens": self.config.max_tokens,
             "temperature": self.config.temperature,
@@ -651,12 +755,8 @@ impl CompletionProvider for MistralRs {
 
         let mut request = self.client.post(&url).json(&completion_req);
 
-        if let Some(api_key) = &self.config.api_key {
-            request = request.bearer_auth(api_key);
-        }
-
-        if let Some(timeout) = self.config.timeout_seconds {
-            request = request.timeout(std::time::Duration::from_secs(timeout));
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
         }
 
         let resp = request.send().await?.error_for_status()?;
@@ -677,28 +777,32 @@ impl CompletionProvider for MistralRs {
 #[async_trait]
 impl EmbeddingProvider for MistralRs {
     async fn embed(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>, LLMError> {
-        if self.config.base_url.is_empty() {
-            return Err(LLMError::InvalidRequest("Missing base_url".to_string()));
+        if self.is_embedded() {
+            return Err(LLMError::ProviderError(
+                "Embeddings not supported in embedded mode. Use server mode with an embedding model.".into(),
+            ));
         }
-        let url = format!("{}/v1/embeddings", self.config.base_url);
 
-        let body = MistralRsEmbeddingRequest {
-            model: self.config.model.clone(),
+        // Server mode
+        let (base_url, model, api_key) = self
+            .get_server_config()
+            .ok_or_else(|| LLMError::InvalidRequest("Missing server configuration".to_string()))?;
+
+        let url = format!("{}/v1/embeddings", base_url);
+
+        let body = ServerEmbeddingRequest {
+            model: model.to_string(),
             input,
         };
 
         let mut request = self.client.post(&url).json(&body);
 
-        if let Some(api_key) = &self.config.api_key {
-            request = request.bearer_auth(api_key);
-        }
-
-        if let Some(timeout) = self.config.timeout_seconds {
-            request = request.timeout(std::time::Duration::from_secs(timeout));
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
         }
 
         let resp = request.send().await?.error_for_status()?;
-        let json_resp: MistralRsEmbeddingResponse = resp.json().await?;
+        let json_resp: ServerEmbeddingResponse = resp.json().await?;
 
         let mut embeddings = vec![vec![]; json_resp.data.len()];
         for data in json_resp.data {
@@ -733,25 +837,74 @@ impl ModelsProvider for MistralRs {
         &self,
         _request: Option<&ModelListRequest>,
     ) -> Result<Box<dyn ModelListResponse>, LLMError> {
-        if self.config.base_url.is_empty() {
-            return Err(LLMError::InvalidRequest("Missing base_url".to_string()));
+        if self.is_embedded() {
+            // In embedded mode, return the loaded model
+            return Ok(Box::new(EmbeddedModelListResponse {
+                model_id: match &self.config.mode {
+                    MistralRsMode::Embedded { model_id, .. } => model_id.clone(),
+                    _ => "unknown".to_string(),
+                },
+            }));
         }
 
-        let url = format!("{}/v1/models", self.config.base_url);
+        // Server mode
+        let (base_url, _, api_key) = self
+            .get_server_config()
+            .ok_or_else(|| LLMError::InvalidRequest("Missing server configuration".to_string()))?;
+
+        let url = format!("{}/v1/models", base_url);
 
         let mut request = self.client.get(&url);
 
-        if let Some(api_key) = &self.config.api_key {
-            request = request.bearer_auth(api_key);
-        }
-
-        if let Some(timeout) = self.config.timeout_seconds {
-            request = request.timeout(std::time::Duration::from_secs(timeout));
+        if let Some(key) = api_key {
+            request = request.bearer_auth(key);
         }
 
         let resp = request.send().await?.error_for_status()?;
-        let result: MistralRsModelListResponse = resp.json().await?;
+        let result: ServerModelListResponse = resp.json().await?;
         Ok(Box::new(result))
+    }
+}
+
+struct EmbeddedModelListResponse {
+    model_id: String,
+}
+
+unsafe impl Send for EmbeddedModelListResponse {}
+unsafe impl Sync for EmbeddedModelListResponse {}
+
+impl ModelListResponse for EmbeddedModelListResponse {
+    fn get_models(&self) -> Vec<String> {
+        vec![self.model_id.clone()]
+    }
+
+    fn get_models_raw(&self) -> Vec<Box<dyn ModelListRawEntry>> {
+        vec![Box::new(EmbeddedModelRawEntry {
+            id: self.model_id.clone(),
+        })]
+    }
+
+    fn get_backend(&self) -> LLMBackend {
+        LLMBackend::MistralRs
+    }
+}
+
+#[derive(Debug)]
+struct EmbeddedModelRawEntry {
+    id: String,
+}
+
+impl ModelListRawEntry for EmbeddedModelRawEntry {
+    fn get_id(&self) -> String {
+        self.id.clone()
+    }
+
+    fn get_created_at(&self) -> DateTime<Utc> {
+        DateTime::<Utc>::UNIX_EPOCH
+    }
+
+    fn get_raw(&self) -> Value {
+        serde_json::json!({"id": self.id})
     }
 }
 
@@ -762,17 +915,7 @@ impl crate::LLMProvider for MistralRs {
 }
 
 /// Parses a Server-Sent Events (SSE) chunk from mistral.rs's streaming API.
-///
-/// # Arguments
-///
-/// * `chunk` - The raw SSE chunk text
-///
-/// # Returns
-///
-/// * `Ok(Some(String))` - Content token if found
-/// * `Ok(None)` - If chunk should be skipped (e.g., ping, done signal)
-/// * `Err(LLMError)` - If parsing fails
-fn parse_mistral_rs_sse(chunk: &str) -> Result<Option<String>, LLMError> {
+fn parse_server_sse(chunk: &str) -> Result<Option<String>, LLMError> {
     let mut collected_content = String::new();
 
     for line in chunk.lines() {
@@ -786,7 +929,7 @@ fn parse_mistral_rs_sse(chunk: &str) -> Result<Option<String>, LLMError> {
                 continue;
             }
 
-            match serde_json::from_str::<MistralRsStreamChunk>(data) {
+            match serde_json::from_str::<ServerStreamChunk>(data) {
                 Ok(response) => {
                     for choice in &response.choices {
                         if let Some(content) = &choice.delta.content {

@@ -48,7 +48,9 @@ groq = []
 azure_openai = []
 cohere = []
 mistral = []
-mistral_rs = []
+mistral_rs = ["dep:mistralrs"]
+mistral_rs_server = []
+mistral_rs_full = ["mistral_rs", "mistral_rs_server"]
 openrouter = []
 huggingface = []
 bedrock = [
@@ -145,6 +147,7 @@ shell-words = { version = "1.1", optional = true }
 portable-pty = { version = "0.8", optional = true }
 pest = { version = "2.7", optional = true }
 pest_derive = { version = "2.7", optional = true }
+mistralrs = { version = "0.8", optional = true }
 
 [[bin]]
 name = "llm"

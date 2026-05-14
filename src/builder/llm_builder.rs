@@ -123,4 +123,17 @@ impl LLMBuilder {
         self.state.google_service_tier = Some(service_tier);
         self
     }
+
+    /// Sets the quantization level for embedded mistral.rs models.
+    ///
+    /// Only applies when using the MistralRs backend with embedded mode.
+    /// Use "q4" for 4-bit, "q8" for 8-bit, or "none" for no quantization.
+    /// Default is 4-bit quantization for lower memory usage.
+    ///
+    /// Embedded mode is automatically enabled when the model identifier
+    /// contains a '/' (e.g., "Qwen/Qwen3-4B").
+    pub fn quantization(mut self, quantization: impl Into<String>) -> Self {
+        self.state.quantization = Some(quantization.into());
+        self
+    }
 }

@@ -55,6 +55,7 @@ pub(crate) struct BuilderState {
     pub(crate) resilient_base_delay_ms: Option<u64>,
     pub(crate) resilient_max_delay_ms: Option<u64>,
     pub(crate) resilient_jitter: Option<bool>,
+    pub(crate) quantization: Option<String>,
     #[cfg(feature = "google")]
     pub(crate) google_service_tier: Option<crate::backends::google::GoogleServiceTier>,
 }
